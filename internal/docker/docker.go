@@ -537,8 +537,8 @@ func RunContainer(ctx context.Context, img string, opts ...RunContainerOption) (
 }
 
 type containerStarter interface {
-	ContainerStart(context.Context, string, client.ContainerStartOptions) (client.ContainerStartResult, error)
-	ContainerAttach(context.Context, string, client.ContainerAttachOptions) (client.ContainerAttachResult, error)
+	ContainerStart(ctx context.Context, id string, opts client.ContainerStartOptions) (client.ContainerStartResult, error)
+	ContainerAttach(ctx context.Context, id string, opts client.ContainerAttachOptions) (client.ContainerAttachResult, error)
 }
 
 // startAndAttach starts a container before attaching to its streams. Podman's
