@@ -38,8 +38,8 @@ import (
 
 	"github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/async"
-	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 	"github.com/crossplane/cli/v2/pkg/schemas/generator"
+	clixpkg "github.com/crossplane/cli/v2/pkg/xpkg"
 )
 
 const configurationPackageYAML = `apiVersion: meta.pkg.crossplane.io/v1

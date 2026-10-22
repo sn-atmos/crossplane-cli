@@ -39,11 +39,11 @@ import (
 	"github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/async"
 	"github.com/crossplane/cli/v2/internal/git"
-	clixpkg "github.com/crossplane/cli/v2/internal/xpkg"
 	"github.com/crossplane/cli/v2/pkg/project/projectfile"
 	"github.com/crossplane/cli/v2/pkg/schemas/generator"
 	smanager "github.com/crossplane/cli/v2/pkg/schemas/manager"
 	"github.com/crossplane/cli/v2/pkg/schemas/runner"
+	clixpkg "github.com/crossplane/cli/v2/pkg/xpkg"
 )
 
 // Manager manages dependencies for a Crossplane project, including fetching
