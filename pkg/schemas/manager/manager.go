@@ -32,8 +32,8 @@ import (
 
 	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/filesystem"
-	"github.com/crossplane/cli/v2/internal/schemas/generator"
-	"github.com/crossplane/cli/v2/internal/schemas/runner"
+	"github.com/crossplane/cli/v2/pkg/schemas/generator"
+	"github.com/crossplane/cli/v2/pkg/schemas/runner"
 )
 
 // Manager is a schema manager. It manages a directory of schemas, generating

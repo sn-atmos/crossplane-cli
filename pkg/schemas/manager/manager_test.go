@@ -24,8 +24,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/afero"
 
-	"github.com/crossplane/cli/v2/internal/schemas/generator"
-	"github.com/crossplane/cli/v2/internal/schemas/runner"
+	"github.com/crossplane/cli/v2/pkg/schemas/generator"
+	"github.com/crossplane/cli/v2/pkg/schemas/runner"
 )
 
 func TestManager_Add(t *testing.T) {

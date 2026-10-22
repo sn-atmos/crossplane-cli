@@ -38,7 +38,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/xpkg"
 
 	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
-	"github.com/crossplane/cli/v2/internal/project/functions"
+	"github.com/crossplane/cli/v2/pkg/project/functions"
 )
 
 // xrdYAML returns an XRD manifest for a resource with the given group/kind.

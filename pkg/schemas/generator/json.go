@@ -37,7 +37,7 @@ import (
 
 	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/crd"
-	"github.com/crossplane/cli/v2/internal/schemas/runner"
+	"github.com/crossplane/cli/v2/pkg/schemas/runner"
 )
 
 // CRDJSONSchema holds a marshaled JSON Schema derived from a single CRD version.

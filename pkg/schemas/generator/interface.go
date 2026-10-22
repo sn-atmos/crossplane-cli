@@ -24,7 +24,7 @@ import (
 
 	"github.com/spf13/afero"
 
-	"github.com/crossplane/cli/v2/internal/schemas/runner"
+	"github.com/crossplane/cli/v2/pkg/schemas/runner"
 )
 
 // Interface generates schemas for a specific language.
