@@ -53,7 +53,7 @@ import (
 
 	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
 	"github.com/crossplane/cli/v2/internal/async"
-	"github.com/crossplane/cli/v2/internal/dependency"
+	"github.com/crossplane/cli/v2/pkg/dependency"
 	"github.com/crossplane/cli/v2/pkg/project/functions"
 	"github.com/crossplane/cli/v2/pkg/schemas/manager"
 )
