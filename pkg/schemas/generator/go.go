@@ -1,0 +1,1765 @@
+/*
+Copyright 2026 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package generator
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/format"
+	"go/parser"
+	"go/printer"
+	"go/token"
+	"io/fs"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/gobuffalo/flect"
+	"github.com/oapi-codegen/oapi-codegen/v2/pkg/codegen"
+	"github.com/spf13/afero"
+	"golang.org/x/tools/go/ast/astutil"
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/kube-openapi/pkg/spec3"
+	"k8s.io/kube-openapi/pkg/validation/spec"
+	"sigs.k8s.io/yaml"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+
+	xpv1 "github.com/crossplane/crossplane/apis/v2/apiextensions/v1"
+
+	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
+	"github.com/crossplane/cli/v2/internal/crd"
+	"github.com/crossplane/cli/v2/internal/schemas/runner"
+)
+
+// K8s package constants.
+const (
+	k8sPkgMetaV1        = "io.k8s.apimachinery.pkg.apis.meta.v1"
+	k8sPkgRuntime       = "io.k8s.apimachinery.pkg.runtime"
+	k8sPkgCoreV1        = "io.k8s.api.core.v1"
+	k8sPkgIntStr        = "io.k8s.apimachinery.pkg.util.intstr"
+	k8sPkgResource      = "io.k8s.apimachinery.pkg.api.resource"
+	k8sPkgAutoscalingV1 = "io.k8s.api.autoscaling.v1"
+
+	k8sPkgNameAutoscaling = "autoscaling"
+)
+
+// goModContents is the contents of the go.mod we write for our generated models
+// module. All generated models share the same module so that we can generate a
+// single dependency from embedded Go functions. We always resolve this
+// dependency via a replace statement, so `dev.crossplane.io/models` is never
+// actually used as a URL, just an identifier.
+//
+// It requires k8s.io/apimachinery, which the generated runtime.Object and
+// AddToScheme code needs. We write it unconditionally, even when the
+// generateGoRuntimeObjects feature is off: an unused requirement is harmless to
+// `go build`, and one set of module files is one thing fewer to maintain and
+// test. apimachinery is pinned to the version the Go function template uses, so
+// a function consuming the models via a replace statement still resolves
+// everything from the template's go.sum.
+const goModContents = `module dev.crossplane.io/models
+
+go 1.24.0
+
+require (
+	github.com/oapi-codegen/runtime v1.1.0
+	k8s.io/apimachinery v0.33.0
+)
+
+require (
+	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
+	github.com/fxamacker/cbor/v2 v2.7.0 // indirect
+	github.com/go-logr/logr v1.4.2 // indirect
+	github.com/gogo/protobuf v1.3.2 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/json-iterator/go v1.1.12 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
+	github.com/modern-go/reflect2 v1.0.2 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
+	k8s.io/klog/v2 v2.130.1 // indirect
+	sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 // indirect
+	sigs.k8s.io/structured-merge-diff/v4 v4.6.0 // indirect
+	sigs.k8s.io/yaml v1.4.0 // indirect
+)
+`
+
+// goSumContents is the contents of the go.sum we write for our generated models
+// module alongside the go.mod.
+const goSumContents = `github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
+github.com/apapsch/go-jsonmerge/v2 v2.0.0 h1:axGnT1gRIfimI7gJifB699GoE/oq+F2MU7Dml6nw9rQ=
+github.com/apapsch/go-jsonmerge/v2 v2.0.0/go.mod h1:lvDnEdqiQrp0O42VQGgmlKpxL1AP2+08jFMw88y4klk=
+github.com/bmatcuk/doublestar v1.1.1/go.mod h1:UD6OnuiIn0yFxxA2le/rnRU1G4RaI4UvFv1sNto9p6w=
+github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
+github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
+github.com/fxamacker/cbor/v2 v2.7.0 h1:iM5WgngdRBanHcxugY4JySA0nk1wZorNOpTgCMedv5E=
+github.com/fxamacker/cbor/v2 v2.7.0/go.mod h1:pxXPTn3joSm21Gbwsv0w9OSA2y1HFR9qXEeXQVeNoDQ=
+github.com/go-logr/logr v1.4.2 h1:6pFjapn8bFcIbiKo3XT4j/BhANplGihG6tvd+8rYgrY=
+github.com/go-logr/logr v1.4.2/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+github.com/gogo/protobuf v1.3.2 h1:Ov1cvc58UF3b5XjBnZv7+opcTcQFZebYjWzi34vdm4Q=
+github.com/gogo/protobuf v1.3.2/go.mod h1:P1XiOD3dCwIKUDQYPy72D8LYyHL2YPYrpS2s69NZV8Q=
+github.com/google/go-cmp v0.5.9/go.mod h1:17dUlkBOakJ0+DkrSSNjCkIjxS6bF9zb3elmeNGIjoY=
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
+github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
+github.com/juju/gnuflag v0.0.0-20171113085948-2ce1bb71843d/go.mod h1:2PavIy+JPciBPrBUjwbNvtwB6RQlve+hkpll6QSNmOE=
+github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
+github.com/kisielk/gotool v1.0.0/go.mod h1:XhKaO+MFFWcvkIS/tQcRk01m1F5IRFswLeQ+oQHNcck=
+github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
+github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd h1:TRLaZ9cD/w8PVh93nsPXa1VrQ6jlwL5oN8l14QlcNfg=
+github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
+github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9Gz0M=
+github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
+github.com/oapi-codegen/runtime v1.1.0 h1:rJpoNUawn5XTvekgfkvSZr0RqEnoYpFkyvrzfWeFKWM=
+github.com/oapi-codegen/runtime v1.1.0/go.mod h1:BeSfBkWWWnAnGdyS+S/GnlbmHKzf8/hwkvelJZDeKA8=
+github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
+github.com/spkg/bom v0.0.0-20160624110644-59b7046e48ad/go.mod h1:qLr4V1qq6nMqFKkMo8ZTx3f+BZEkzsRUY10Xsm2mwU0=
+github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+github.com/stretchr/testify v1.10.0 h1:Xv5erBjTwe/5IxqUQTdXv5kgmIvbHo3QQyRwhJsOfJA=
+github.com/stretchr/testify v1.10.0/go.mod h1:r2ic/lqez/lEtzL7wO/rwa5dbSLXVDPFyf8C91i36aY=
+github.com/x448/float16 v0.8.4 h1:qLwI1I70+NjRFUR3zs1JPUCgaCXSh3SW62uAKT1mSBM=
+github.com/x448/float16 v0.8.4/go.mod h1:14CWIYCyZA/cWjXOioeEpHeN/83MdbZDRQHoFcYsOfg=
+github.com/yuin/goldmark v1.1.27/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+github.com/yuin/goldmark v1.2.1/go.mod h1:3hX8gzYuyVAZsxl0MRgGTJEmQBFcNTphYh9decYSb74=
+golang.org/x/crypto v0.0.0-20190308221718-c2843e01d9a2/go.mod h1:djNgcEr1/C05ACkg1iLfiJU5Ep61QUkGW8qpdssI0+w=
+golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550/go.mod h1:yigFU9vqHzYiE8UmvKecakEJjdnWj3jj499lnFckfCI=
+golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9/go.mod h1:LzIPMQfyMNhhGPhUkYOs5KpL4U8rLKemX1yGLhDgUto=
+golang.org/x/mod v0.2.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+golang.org/x/mod v0.3.0/go.mod h1:s0Qsj1ACt9ePp/hMypM3fl4fZqREWJwdYDEqhRiZZUA=
+golang.org/x/net v0.0.0-20190404232315-eb5bcb51f2a3/go.mod h1:t9HGtf8HONx5eT2rtn7q6eTqICYqUVnKs3thJo3Qplg=
+golang.org/x/net v0.0.0-20190620200207-3b0461eec859/go.mod h1:z5CRVTTTmAJ677TzLLGU+0bjPO0LkuOLi4/5GtJWs/s=
+golang.org/x/net v0.0.0-20200226121028-0de0cce0169b/go.mod h1:z5CRVTTTmAJ677TzLLGU+0bjPO0LkuOLi4/5GtJWs/s=
+golang.org/x/net v0.0.0-20201021035429-f5854403a974/go.mod h1:sp8m0HH+o8qH0wwXwYZr8TS3Oi6o0r6Gce1SSxlDquU=
+golang.org/x/net v0.38.0 h1:vRMAPTMaeGqVhG5QyLJHqNDwecKTomGeqbnfZyKlBI8=
+golang.org/x/net v0.38.0/go.mod h1:ivrbrMbzFq5J41QOQh0siUuly180yBYtLp+CKbEaFx8=
+golang.org/x/sync v0.0.0-20190423024810-112230192c58/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+golang.org/x/sys v0.0.0-20190215142949-d0b11bdaac8a/go.mod h1:STP8DvDyc/dI5b8T5hshtkjS+E42TnysNCUPdjciGhY=
+golang.org/x/sys v0.0.0-20190412213103-97732733099d/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+golang.org/x/sys v0.0.0-20200930185726-fdedc70b468f/go.mod h1:h1NjWce9XRLGQEsW7wpKNCjG9DtNlClVuFLEZdDNbEs=
+golang.org/x/text v0.3.0/go.mod h1:NqM8EUOU14njkJ3fqMW+pc6Ldnwhi/IjpwHt7yyuwOQ=
+golang.org/x/text v0.3.3/go.mod h1:5Zoc/QRtKVWzQhOtBMvqHzDpF6irO9z98xDceosuGiQ=
+golang.org/x/text v0.23.0 h1:D71I7dUrlY+VX0gQShAThNGHFxZ13dGLBHQLVl1mJlY=
+golang.org/x/text v0.23.0/go.mod h1:/BLNzu4aZCJ1+kcD0DNRotWKage4q2rGVAg4o22unh4=
+golang.org/x/tools v0.0.0-20180917221912-90fa682c2a6e/go.mod h1:n7NCudcB/nEzxVGmLbDWY5pfWTLqBcC2KZ6jyYvM4mQ=
+golang.org/x/tools v0.0.0-20191119224855-298f0cb1881e/go.mod h1:b+2E5dAYhXwXZwtnZ6UAqBI28+e2cm9otk0dWdXHAEo=
+golang.org/x/tools v0.0.0-20200619180055-7c47624df98f/go.mod h1:EkVYQZoAsY45+roYkvgYkIh4xh/qjgUK9TdY2XT94GE=
+golang.org/x/tools v0.0.0-20210106214847-113979e3529a/go.mod h1:emZCQorbCU4vsT4fOWvOPXz4eW1wZW4PmDk9uLelYpA=
+golang.org/x/xerrors v0.0.0-20190717185122-a985d3407aa7/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+golang.org/x/xerrors v0.0.0-20191011141410-1b5146add898/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
+gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
+gopkg.in/inf.v0 v0.9.1 h1:73M5CoZyi3ZLMOyDlQh031Cx6N9NDJ2Vvfl76EDAgDc=
+gopkg.in/inf.v0 v0.9.1/go.mod h1:cWUDdTG/fYaXco+Dcufb5Vnc6Gp2YChqWtbxRZE0mXw=
+gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
+gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
+k8s.io/apimachinery v0.33.0 h1:1a6kHrJxb2hs4t8EE5wuR/WxKDwGN1FKH3JvDtA0CIQ=
+k8s.io/apimachinery v0.33.0/go.mod h1:BHW0YOu7n22fFv/JkYOEfkUYNRN0fj0BlvMFWA7b+SM=
+k8s.io/klog/v2 v2.130.1 h1:n9Xl7H1Xvksem4KFG4PYbdQCQxqc/tTUyrgXaOhHSzk=
+k8s.io/klog/v2 v2.130.1/go.mod h1:3Jpz1GvMt720eyJH1ckRHK1EDfpxISzJ7I9OYgaDtPE=
+k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738 h1:M3sRQVHv7vB20Xc2ybTt7ODCeFj6JSWYFzOFnYeS6Ro=
+k8s.io/utils v0.0.0-20241104100929-3ea5e8cea738/go.mod h1:OLgZIPagt7ERELqWJFomSt595RzquPNLL48iOWgYOg0=
+sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3 h1:/Rv+M11QRah1itp8VhT6HoVx1Ray9eB4DBr+K+/sCJ8=
+sigs.k8s.io/json v0.0.0-20241010143419-9aa6b5e7a4b3/go.mod h1:18nIHnGi6636UCz6m8i4DhaJ65T6EruyzmoQqI2BVDo=
+sigs.k8s.io/randfill v0.0.0-20250304075658-069ef1bbf016/go.mod h1:XeLlZ/jmk4i1HRopwe7/aU3H5n1zNUcX6TM94b3QxOY=
+sigs.k8s.io/randfill v1.0.0 h1:JfjMILfT8A6RbawdsK2JXGBR5AQVfd+9TbzrlneTyrU=
+sigs.k8s.io/randfill v1.0.0/go.mod h1:XeLlZ/jmk4i1HRopwe7/aU3H5n1zNUcX6TM94b3QxOY=
+sigs.k8s.io/structured-merge-diff/v4 v4.6.0 h1:IUA9nvMmnKWcj5jl84xn+T5MnlZKThmUW1TdblaLVAc=
+sigs.k8s.io/structured-merge-diff/v4 v4.6.0/go.mod h1:dDy58f92j70zLsuZVuUX5Wp9vtxXpaZnkPGWeqDfCps=
+sigs.k8s.io/yaml v1.4.0 h1:Mk1wCc2gy/F0THH0TAp1QYyJNzRm2KCLy3o5ASXVI5E=
+sigs.k8s.io/yaml v1.4.0/go.mod h1:Ejl7/uTz7PSA4eKMyQCUTnhZYNmLIl+5c2lQPGR2BPY=
+`
+
+// goImportsTemplate replaces the default import template for oapi-codegen,
+// since it contains many imports we don't use and will thus result in code that
+// doesn't compile.
+const goImportsTemplate = `// Package {{.PackageName}} contains generated models.
+//
+// Code generated by {{.ModuleName}} version {{.Version}} DO NOT EDIT.
+package {{.PackageName}}
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/oapi-codegen/runtime"
+	openapi_types "github.com/oapi-codegen/runtime/types"
+
+	{{- range .ExternalImports}}
+	{{ . }}
+	{{- end}}
+	{{- range .AdditionalImports}}
+	{{.Alias}} "{{.Package}}"
+	{{- end}}
+)
+
+// Use the following to avoid unused import errors.
+var (
+	_ *time.Time      = nil
+	_ json.RawMessage = nil
+	_ = fmt.Errorf
+	_ = runtime.JSONMerge
+	_ openapi_types.Email
+)
+`
+
+// goGenerator generates Go models. accessors controls whether GetX/SetX
+// accessor methods are emitted for the generated structs; runtimeObjects
+// controls whether DeepCopy / runtime.Object methods and per-package
+// AddToScheme helpers are emitted.
+type goGenerator struct {
+	accessors      bool
+	runtimeObjects bool
+}
+
+func (goGenerator) Language() string {
+	return devv1alpha1.SchemaLanguageGo
+}
+
+// GenerateFromCRD generates Go schemas for the CRDs in the given filesystem.
+func (g goGenerator) GenerateFromCRD(_ context.Context, fromFS afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	openAPIs, err := goCollectOpenAPIs(fromFS)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(openAPIs) == 0 {
+		// Return nil if no specs were generated
+		return nil, nil
+	}
+
+	// Initialize the schema filesystem
+	schemaFS, err := initializeSchemaFS()
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract shared k8s schemas and generate separate files for each package.
+	// We have to do this before generating the other models below because
+	// the code below replaces the k8s models with references to these shared
+	// ones in-place in the spec.
+	k8sSchemasByPackage := make(map[string]map[string]*spec.Schema)
+
+	// Collect all K8s schemas from all OpenAPI specs, grouped by package
+	for _, oapi := range openAPIs {
+		packagedSchemas := goExtractK8sSchemas(oapi.spec)
+		for pkg, schemas := range packagedSchemas {
+			if k8sSchemasByPackage[pkg] == nil {
+				k8sSchemasByPackage[pkg] = make(map[string]*spec.Schema)
+			}
+			maps.Copy(k8sSchemasByPackage[pkg], schemas)
+		}
+	}
+
+	// Generate separate files for each K8s package
+	for pkg, schemas := range k8sSchemasByPackage {
+		if err := g.generateSharedK8sPackage(schemaFS, pkg, schemas); err != nil {
+			return nil, err
+		}
+	}
+
+	// Generate models for the non-k8s schemas.
+	for _, oapi := range openAPIs {
+		code, err := generateGo(oapi.spec, oapi.version,
+			goRemoveValidationOnlyCombinators,
+			goRenameTypes,
+			goRenameEnums,
+			goReplaceNumberWithInt,
+			goRemoveRequired,
+			goReferenceK8sTypesForCRDs,
+			goRemoveK8s,
+			goKeepOnlyComponents,
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		// Add the generated methods last, so they see the final type names.
+		// runtime.Object goes first: addAccessors skips methods that already exist,
+		// so a field-derived accessor that would collide with one of these (say a
+		// field named objectKind) gives way, rather than emitting a duplicate.
+		code, err = applyRuntimeObjects(code, g.runtimeObjects)
+		if err != nil {
+			return nil, err
+		}
+		code, err = applyAccessors(code, g.accessors)
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to generate Go model accessors")
+		}
+
+		crdPkg := packageInGroup(oapi.crd.Spec.Group, oapi.crd.Spec.Names.Kind, oapi.version)
+		if err := writeGoCode(schemaFS, crdPkg, code); err != nil {
+			return nil, err
+		}
+	}
+
+	return schemaFS, nil
+}
+
+// generateSharedK8sPackage generates the Go model file for a single shared K8s
+// package (e.g. meta/v1) into schemaFS.
+func (g goGenerator) generateSharedK8sPackage(schemaFS afero.Fs, pkg string, schemas map[string]*spec.Schema) error {
+	if len(schemas) == 0 {
+		return nil
+	}
+
+	// Create a spec for this package
+	pkgSpec := &spec3.OpenAPI{
+		Version: "3.0.0",
+		Components: &spec3.Components{
+			Schemas: schemas,
+		},
+	}
+
+	// Determine the package layout, API group and version from the package name.
+	// These layout labels differ from the ones getK8sPackageInfo returns: the CRD
+	// path puts meta/v1 at io/k8s/meta/v1, the OpenAPI path at
+	// io/k8s/core/meta/v1. The API group is the same either way — metav1 types
+	// are in the core (empty) group.
+	var goPkg goPackage
+	switch pkg {
+	case k8sPkgMetaV1:
+		goPkg = goPackage{group: "meta.k8s.io", kind: "meta", version: "v1"}
+	case k8sPkgAutoscalingV1:
+		goPkg = goPackage{
+			group:    k8sPkgNameAutoscaling,
+			apiGroup: k8sPkgNameAutoscaling,
+			kind:     k8sPkgNameAutoscaling,
+			version:  "v1",
+		}
+	}
+
+	// For K8s packages that reference meta.v1, we need to use the correct
+	// meta import path. The meta.v1 package uses goReferenceK8sTypes (core
+	// path) because self-references get stripped. Other packages like
+	// autoscaling use goReferenceK8sTypesForCRDs (non-core path) to
+	// reference the CRD meta.v1 package at
+	// dev.crossplane.io/models/io/k8s/meta/v1.
+	refMutator := goReferenceK8sTypes
+	if pkg != k8sPkgMetaV1 {
+		refMutator = goReferenceK8sTypesForCRDs
+	}
+
+	code, err := generateGo(pkgSpec, goPkg.version,
+		goRemoveValidationOnlyCombinators,
+		goRenameTypes,
+		goRenameEnums,
+		goReplaceNumberWithInt,
+		goRemoveRequired,
+		refMutator,
+	)
+	if err != nil {
+		return err
+	}
+
+	// shorten the auto‑generated K8s type names
+	code, err = fixK8sTypeNames(code)
+	if err != nil {
+		return err
+	}
+
+	// remove the self‑import (e.g. meta/v1 importing itself)
+	code, err = removeSelfImports(code, pkg)
+	if err != nil {
+		return err
+	}
+
+	// Add the generated methods last, so they see the final type names.
+	// runtime.Object goes first: addAccessors skips methods that already exist,
+	// so a field-derived accessor that would collide with one of these (say a
+	// field named objectKind) gives way, rather than emitting a duplicate.
+	code, err = applyRuntimeObjects(code, g.runtimeObjects)
+	if err != nil {
+		return err
+	}
+	code, err = applyAccessors(code, g.accessors)
+	if err != nil {
+		return errors.Wrap(err, "failed to generate Go model accessors")
+	}
+
+	return writeGoCode(schemaFS, goPkg, code)
+}
+
+type goOpenAPI struct {
+	crd     *extv1.CustomResourceDefinition
+	version string
+	spec    *spec3.OpenAPI
+}
+
+func goCollectOpenAPIs(fromFS afero.Fs) ([]goOpenAPI, error) { //nolint:gocognit // Hard to split this up, and it's not too long to read.
+	crdFS := afero.NewMemMapFs()
+	baseFolder := "workdir"
+
+	if err := crdFS.MkdirAll(baseFolder, 0o755); err != nil {
+		return nil, err
+	}
+
+	var openAPIs []goOpenAPI
+	return openAPIs, afero.Walk(fromFS, "", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+		// Ignore files without yaml extensions.
+		ext := filepath.Ext(path)
+		if ext != ".yaml" && ext != ".yml" {
+			return nil
+		}
+
+		var u metav1.TypeMeta
+		bs, err := afero.ReadFile(fromFS, path)
+		if err != nil {
+			return errors.Wrapf(err, "failed to read file %q", path)
+		}
+		err = yaml.Unmarshal(bs, &u)
+		if err != nil {
+			return errors.Wrapf(err, "failed to parse file %q", path)
+		}
+
+		switch u.GroupVersionKind().Kind {
+		case xpv1.CompositeResourceDefinitionKind:
+			// Process the XRD and get the paths
+			xrPath, claimPath, err := crd.ProcessXRD(crdFS, bs, path, baseFolder)
+			if err != nil {
+				return err
+			}
+
+			if xrPath != "" {
+				bs, err := afero.ReadFile(crdFS, xrPath)
+				if err != nil {
+					return errors.Wrapf(err, "failed to read file %q", xrPath)
+				}
+
+				var c extv1.CustomResourceDefinition
+				if err := yaml.Unmarshal(bs, &c); err != nil {
+					return errors.Wrapf(err, "failed to unmarshal CRD file %q", xrPath)
+				}
+
+				oapis, err := crd.ToOpenAPI(&c)
+				if err != nil {
+					return err
+				}
+				for version, oapi := range oapis {
+					openAPIs = append(openAPIs, goOpenAPI{spec: oapi, version: version, crd: &c})
+				}
+			}
+			if claimPath != "" {
+				bs, err := afero.ReadFile(crdFS, claimPath)
+				if err != nil {
+					return errors.Wrapf(err, "failed to read file %q", claimPath)
+				}
+
+				var c extv1.CustomResourceDefinition
+				if err := yaml.Unmarshal(bs, &c); err != nil {
+					return errors.Wrapf(err, "failed to unmarshal CRD file %q", claimPath)
+				}
+
+				oapis, err := crd.ToOpenAPI(&c)
+				if err != nil {
+					return err
+				}
+				for version, oapi := range oapis {
+					openAPIs = append(openAPIs, goOpenAPI{spec: oapi, version: version, crd: &c})
+				}
+			}
+
+		case "CustomResourceDefinition":
+			var c extv1.CustomResourceDefinition
+			if err := yaml.Unmarshal(bs, &c); err != nil {
+				return errors.Wrapf(err, "failed to unmarshal CRD file %q", path)
+			}
+
+			oapis, err := crd.ToOpenAPI(&c)
+			if err != nil {
+				return err
+			}
+			for version, oapi := range oapis {
+				openAPIs = append(openAPIs, goOpenAPI{spec: oapi, version: version, crd: &c})
+			}
+		}
+		return nil
+	})
+}
+
+// generateGoMutex prevents concurrent calls to `codegen.Generate` in
+// `generateGo`, since `codegen.Generate` is not concurrency safe.
+var generateGoMutex sync.Mutex //nolint:gochecknoglobals // Must be global.
+
+func generateGo(s *spec3.OpenAPI, version string, mutators ...func(*spec3.OpenAPI)) (string, error) {
+	// codegen.Generate sets some global state that's used by the utility
+	// functions we call from our mutators. That has two implications for us:
+	//
+	// 1. We must hold the `generateGoMutex` while calling the mutators, not
+	//    just when we call `codegen.Generate`.
+	// 2. We must call `codegen.Generate` with the options we're going to use
+	//    *before* we call the mutators, so that the global state is correct
+	//    inside the codegen package. We call it with a minimal input and ignore
+	//    the output - this call is just to set up the global state. Once
+	//    https://github.com/oapi-codegen/oapi-codegen/pull/2393 is merged we
+	//    can use `codegen.SetGlobalStateOptions` instead of calling `Generate`.
+	generateGoMutex.Lock()
+	defer generateGoMutex.Unlock()
+
+	cfg := codegen.Configuration{
+		PackageName: version,
+		Generate: codegen.GenerateOptions{
+			Models: true,
+		},
+		OutputOptions: codegen.OutputOptions{
+			SkipPrune:      true,
+			NameNormalizer: string(codegen.NameNormalizerFunctionToCamelCaseWithInitialisms),
+			SkipFmt:        true,
+			UserTemplates: map[string]string{
+				"imports.tmpl": goImportsTemplate,
+			},
+		},
+	}
+	_, err := codegen.Generate(&openapi3.T{}, cfg)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to setup codegen global state")
+	}
+
+	for _, mut := range mutators {
+		mut(s)
+	}
+
+	// Round-trip through JSON to convert the spec to the kin library used by
+	// oapi-codegen.
+	bs, err := json.Marshal(s)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to marshal OpenAPI spec")
+	}
+	ld := openapi3.NewLoader()
+	oapiInput, err := ld.LoadFromData(bs)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse OpenAPI spec")
+	}
+
+	// Generate code!
+	goCode, err := codegen.Generate(oapiInput, cfg)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to generate go code from OpenAPI schema")
+	}
+
+	// Post-process to fix missing imports for map value types
+	goCode, err = fixMissingImports(goCode)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to fix missing imports")
+	}
+
+	goCodeBytes, err := format.Source([]byte(goCode))
+	if err != nil {
+		return "", errors.Wrap(err, "failed to format go code")
+	}
+
+	return string(goCodeBytes), nil
+}
+
+// goExtractK8sSchemas returns all k8s schemas from the given OpenAPI
+// spec, grouped by their package.
+func goExtractK8sSchemas(s *spec3.OpenAPI) map[string]map[string]*spec.Schema {
+	ret := make(map[string]map[string]*spec.Schema)
+
+	// Define the K8s packages we want to extract
+	k8sPackages := []string{
+		k8sPkgMetaV1,
+		k8sPkgRuntime,
+		k8sPkgCoreV1,
+		k8sPkgIntStr,
+		k8sPkgResource,
+		k8sPkgAutoscalingV1,
+	}
+
+	// Initialize the map for each package
+	for _, pkg := range k8sPackages {
+		ret[pkg] = make(map[string]*spec.Schema)
+	}
+
+	// Group schemas by their package
+	for name, schema := range s.Components.Schemas {
+		for _, pkg := range k8sPackages {
+			if strings.Contains(name, pkg) {
+				ret[pkg][name] = schema
+				break
+			}
+		}
+	}
+
+	// Remove empty groups
+	for pkg := range ret {
+		if len(ret[pkg]) == 0 {
+			delete(ret, pkg)
+		}
+	}
+
+	return ret
+}
+
+// goPackage identifies a generated models package.
+type goPackage struct {
+	// group drives the generated directory layout, see goSchemaPath. For the
+	// built-in Kubernetes packages it is a synthetic label rather than a real
+	// API group.
+	group string
+
+	// apiGroup is the Kubernetes API group the package's types belong to, i.e.
+	// the group in their apiVersion. It is what we register them under in a
+	// runtime.Scheme, so it must not be a synthetic label.
+	apiGroup string
+
+	kind    string
+	version string
+}
+
+// packageInGroup returns the goPackage for types in a real API group, where the
+// group serves as both the layout group and the API group. That covers CRDs, and
+// the OpenAPI schemas carrying an x-kubernetes-group-version-kind extension.
+func packageInGroup(group, kind, version string) goPackage {
+	return goPackage{group: group, apiGroup: group, kind: kind, version: version}
+}
+
+func writeGoCode(schemaFS afero.Fs, pkg goPackage, code string) error {
+	goPath := filepath.Join("models", goSchemaPath(pkg.group, pkg.kind, pkg.version))
+	dir := filepath.Dir(goPath)
+	if err := schemaFS.MkdirAll(dir, 0o755); err != nil {
+		return errors.Wrap(err, "failed to create directory for schemas")
+	}
+
+	f, err := schemaFS.Create(goPath)
+	if err != nil {
+		return errors.Wrap(err, "failed to create go schema file")
+	}
+	if _, err := f.WriteString(code); err != nil {
+		return errors.Wrap(err, "failed to write go code to file")
+	}
+	_ = f.Close()
+
+	// When the generated code registers types with a scheme (only when the
+	// runtime.Object feature is on), emit a groupversion_info.go for the package
+	// defining GroupVersion/SchemeBuilder/AddToScheme. Written once per dir.
+	if strings.Contains(code, "SchemeBuilder.Register(") {
+		if err := writeGroupVersionInfo(schemaFS, dir, pkg.apiGroup, pkg.version); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// writeGroupVersionInfo writes a groupversion_info.go into dir defining the
+// package's GroupVersion, SchemeBuilder and AddToScheme. It is a no-op if the
+// file already exists, so a package with multiple kinds gets a single copy.
+// group must be a real API group, not a layout label; see goPackage.
+func writeGroupVersionInfo(schemaFS afero.Fs, dir, group, version string) error {
+	path := filepath.Join(dir, "groupversion_info.go")
+	if exists, err := afero.Exists(schemaFS, path); err != nil {
+		return errors.Wrap(err, "failed to stat groupversion_info.go")
+	} else if exists {
+		return nil
+	}
+
+	code := fmt.Sprintf(`// Code generated by github.com/crossplane/cli/v2 DO NOT EDIT.
+package %s
+
+import (
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+)
+
+// GroupVersion is the API group and version for the types in this package.
+var GroupVersion = schema.GroupVersion{Group: %q, Version: %q}
+
+// SchemeBuilder collects the functions that register this package's types with
+// a runtime.Scheme. Each type registers itself via an init function.
+var SchemeBuilder = &runtime.SchemeBuilder{}
+
+// AddToScheme registers this package's types with the given runtime.Scheme.
+var AddToScheme = SchemeBuilder.AddToScheme
+`, version, group, version)
+
+	formatted, err := format.Source([]byte(code))
+	if err != nil {
+		return errors.Wrap(err, "failed to format groupversion_info.go")
+	}
+
+	f, err := schemaFS.Create(path)
+	if err != nil {
+		return errors.Wrap(err, "failed to create groupversion_info.go")
+	}
+	if _, err := f.WriteString(string(formatted)); err != nil {
+		return errors.Wrap(err, "failed to write groupversion_info.go")
+	}
+	_ = f.Close()
+
+	return nil
+}
+
+func goSchemaPath(group, kind, version string) string {
+	// Our Go files will live in directories based on the CRD group and
+	// version. The filename is the singular kind of the CRD.
+	//
+	// Example: Kind "Bucket" in group "platform.example.com/v1alpha1" becomes
+	// com/example/platform/v1alpha1/bucket.go.
+	// Special case: meta.core.k8s.io becomes io/k8s/core/meta/v1 for built-in K8s types
+	if group == "meta.core.k8s.io" {
+		return filepath.Join("io", "k8s", "core", "meta", version, strings.ToLower(kind)+".go")
+	}
+
+	// Handle specific K8s groups that should be under io/k8s/
+	switch group {
+	case "apps", k8sPkgNameAutoscaling, "batch", "policy":
+		return filepath.Join("io", "k8s", group, version, strings.ToLower(kind)+".go")
+	case "resource.k8s.io":
+		// The resource.k8s.io group (dynamic resource allocation) would
+		// collide with the shared apimachinery Quantity package at
+		// io/k8s/resource/v1, so it lives under io/k8s/api/resource instead,
+		// mirroring the upstream k8s.io/api/resource layout.
+		return filepath.Join("io", "k8s", "api", "resource", version, strings.ToLower(kind)+".go")
+	case "resource.apimachinery.k8s.io":
+		// Pseudo-group for the shared apimachinery Quantity package; it keeps
+		// its historical path at io/k8s/resource/v1.
+		return filepath.Join("io", "k8s", "resource", version, strings.ToLower(kind)+".go")
+	}
+
+	path := strings.Split(group, ".")
+	slices.Reverse(path)
+	path = append(path, version, strings.ToLower(kind)+".go")
+
+	return filepath.Join(path...)
+}
+
+// goRenameTypes adds annotations to schemas to cause oapi-codegen to generate
+// nice type names.
+func goRenameTypes(s *spec3.OpenAPI) {
+	for name, schema := range s.Components.Schemas {
+		goName := goFixName(name)
+		if goName == "" {
+			delete(s.Components.Schemas, name)
+			continue
+		}
+		goRenameSchemaType(goName, schema)
+		goRenamePropertyTypes(goName, schema.Properties)
+	}
+}
+
+func goRenamePropertyTypes(baseName string, props map[string]spec.Schema) {
+	for name, prop := range props {
+		goName := goFixName(baseName + flect.Capitalize(name))
+
+		goRenameSchemaType(goName, &prop)
+		goRenamePropertyTypes(goName, prop.Properties)
+
+		if prop.Items != nil {
+			goRenameSchemaType(goName+"Item", prop.Items.Schema)
+			goRenamePropertyTypes(goName+"Item", prop.Items.Schema.Properties)
+		}
+
+		props[name] = prop
+	}
+}
+
+func goFixName(name string) string {
+	lastDot := strings.LastIndex(name, ".")
+	if lastDot == -1 {
+		return codegen.ToCamelCaseWithInitialisms(name)
+	}
+	genName := codegen.SchemaNameToTypeName(name)
+	prefix := codegen.SchemaNameToTypeName(name[:lastDot])
+	return codegen.ToCamelCaseWithInitialisms(strings.TrimPrefix(genName, prefix))
+}
+
+func goRenameSchemaType(name string, schema *spec.Schema) {
+	schema.AddExtension("x-go-type-name", name)
+	schema.AddExtension("x-oapi-codegen-only-honour-go-name", true)
+}
+
+// goRenameEnums names enum values unambiguously so different generated models
+// can live in the same package.
+func goRenameEnums(s *spec3.OpenAPI) {
+	for name, schema := range s.Components.Schemas {
+		goName := goFixName(name)
+		if goName == "" {
+			delete(s.Components.Schemas, name)
+			continue
+		}
+		goRenameEnumValues(goName, schema)
+		goRenamePropertyEnums(goName, schema.Properties)
+	}
+}
+
+func goRenamePropertyEnums(baseName string, props map[string]spec.Schema) {
+	for name, prop := range props {
+		goName := goFixName(baseName + flect.Capitalize(name))
+
+		goRenameEnumValues(goName, &prop)
+		goRenamePropertyEnums(goName, prop.Properties)
+
+		if prop.Items != nil {
+			goRenameEnumValues(goName+"Item", prop.Items.Schema)
+			goRenamePropertyEnums(goName+"Item", prop.Items.Schema.Properties)
+		}
+
+		props[name] = prop
+	}
+}
+
+func goRenameEnumValues(typeName string, schema *spec.Schema) {
+	if schema.Enum == nil {
+		return
+	}
+
+	newNames := make([]string, len(schema.Enum))
+	for i, oldName := range schema.Enum {
+		s, ok := oldName.(string)
+		if !ok {
+			// This should always be true, but we'd rather not panic, so ignore
+			// any non-string enums.
+			continue
+		}
+		newNames[i] = typeName + flect.Capitalize(s)
+	}
+
+	schema.AddExtension("x-enum-varnames", newNames)
+}
+
+// goReplaceNumberWithInt adds annotations to schemas to cause oapi-codegen to
+// generate int type fields instead of floats for numbers.
+func goReplaceNumberWithInt(s *spec3.OpenAPI) {
+	for _, schema := range s.Components.Schemas {
+		goRetypeSchema(schema, "number", "int")
+		goRetypeProperties(schema.Properties, "number", "int")
+	}
+}
+
+func goRetypeProperties(props map[string]spec.Schema, oldType, newType string) {
+	for name, prop := range props {
+		goRetypeSchema(&prop, oldType, newType)
+		if prop.Items != nil {
+			goRetypeSchema(prop.Items.Schema, oldType, newType)
+			goRetypeProperties(prop.Items.Schema.Properties, oldType, newType)
+		}
+		props[name] = prop
+	}
+}
+
+func goRetypeSchema(schema *spec.Schema, oldType, newType string) {
+	if schema.Type.Contains(oldType) {
+		schema.AddExtension("x-go-type", newType)
+	}
+}
+
+// goRemoveValidationOnlyCombinators removes anyOf/oneOf combinators that carry
+// no structural type information. Kubernetes structural schemas allow these
+// junctors only for validation (e.g. "exactly one of endpointSelector and
+// nodeSelector must be set"), where each variant contains only `required`
+// constraints and empty property schemas. oapi-codegen generates a union
+// member type named <TypeName><index> for each variant, so a schema with both
+// anyOf and oneOf produces colliding type names (two <TypeName>0). The
+// variants don't affect the generated Go structs, so we drop them.
+// Combinators with typed variants (e.g. x-kubernetes-int-or-string's
+// anyOf: [{type: integer}, {type: string}]) are kept.
+func goRemoveValidationOnlyCombinators(s *spec3.OpenAPI) {
+	for _, schema := range s.Components.Schemas {
+		goRemoveSchemaValidationOnlyCombinators(schema)
+	}
+}
+
+func goRemoveSchemaValidationOnlyCombinators(schema *spec.Schema) {
+	if schema == nil {
+		return
+	}
+
+	if goCombinatorIsValidationOnly(schema.AnyOf) {
+		schema.AnyOf = nil
+	}
+	if goCombinatorIsValidationOnly(schema.OneOf) {
+		schema.OneOf = nil
+	}
+
+	for i := range schema.AllOf {
+		goRemoveSchemaValidationOnlyCombinators(&schema.AllOf[i])
+	}
+	for i := range schema.AnyOf {
+		goRemoveSchemaValidationOnlyCombinators(&schema.AnyOf[i])
+	}
+	for i := range schema.OneOf {
+		goRemoveSchemaValidationOnlyCombinators(&schema.OneOf[i])
+	}
+	for name, prop := range schema.Properties {
+		goRemoveSchemaValidationOnlyCombinators(&prop)
+		schema.Properties[name] = prop
+	}
+	if schema.Items != nil && schema.Items.Schema != nil {
+		goRemoveSchemaValidationOnlyCombinators(schema.Items.Schema)
+	}
+	if schema.AdditionalProperties != nil && schema.AdditionalProperties.Schema != nil {
+		goRemoveSchemaValidationOnlyCombinators(schema.AdditionalProperties.Schema)
+	}
+}
+
+// goCombinatorIsValidationOnly returns true if all the given anyOf/oneOf
+// variants constrain validation without describing any structure.
+func goCombinatorIsValidationOnly(variants []spec.Schema) bool {
+	if len(variants) == 0 {
+		return false
+	}
+	for i := range variants {
+		if !goSchemaIsValidationOnly(&variants[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func goSchemaIsValidationOnly(s *spec.Schema) bool {
+	if len(s.Type) > 0 || s.Ref.String() != "" || s.Format != "" ||
+		s.Items != nil || s.AdditionalProperties != nil ||
+		len(s.Enum) > 0 || s.Default != nil ||
+		len(s.AllOf) > 0 || len(s.AnyOf) > 0 || len(s.OneOf) > 0 || s.Not != nil {
+		return false
+	}
+	for name := range s.Properties {
+		prop := s.Properties[name]
+		if !goSchemaIsValidationOnly(&prop) {
+			return false
+		}
+	}
+	return true
+}
+
+// goRemoveRequired removes the required fields from schemas. We want all fields
+// in our generated models to be optional (so functions can set only the fields
+// they wish to own).
+func goRemoveRequired(s *spec3.OpenAPI) {
+	for _, schema := range s.Components.Schemas {
+		schema.Required = nil
+		goRemovePropertiesRequired(schema.Properties)
+		if schema.Items != nil {
+			goRemovePropertiesRequired(schema.Items.Schema.Properties)
+		}
+	}
+}
+
+func goRemovePropertiesRequired(props map[string]spec.Schema) {
+	for name, prop := range props {
+		prop.Required = nil
+		goRemovePropertiesRequired(prop.Properties)
+		if prop.Items != nil {
+			prop.Items.Schema.Required = nil
+			goRemovePropertiesRequired(prop.Items.Schema.Properties)
+		}
+
+		props[name] = prop
+	}
+}
+
+// goReferenceK8sTypes converts all references to k8s meta/v1 schemas in the
+// given spec to references to the shared Go models we generate for the k8s
+// schemas.
+func goReferenceK8sTypes(s *spec3.OpenAPI) {
+	for _, schema := range s.Components.Schemas {
+		goReferenceK8sType(schema)
+		goReferenceK8sTypesProperties(schema.Properties)
+	}
+}
+
+// goReferenceK8sTypesForCRDs is like goReferenceK8sTypes but uses different
+// import paths appropriate for CRDs. For CRDs, we only need to handle meta.v1
+// differently since CRDs might use meta.k8s.io group.
+func goReferenceK8sTypesForCRDs(s *spec3.OpenAPI) {
+	for _, schema := range s.Components.Schemas {
+		goReferenceK8sTypeWithMetaPath(schema, false)
+		goReferenceK8sTypesPropertiesWithMetaPath(schema.Properties, false)
+	}
+}
+
+func goReferenceK8sType(schema *spec.Schema) {
+	goReferenceK8sTypeWithMetaPath(schema, true)
+}
+
+func goReferenceK8sTypeWithMetaPath(schema *spec.Schema, useCorePath bool) {
+	// Helper function to check if a reference is a k8s type
+	isK8sRef := func(ref string) bool {
+		return strings.Contains(ref, k8sPkgMetaV1) ||
+			strings.Contains(ref, k8sPkgCoreV1) ||
+			strings.Contains(ref, k8sPkgRuntime) ||
+			strings.Contains(ref, k8sPkgIntStr) ||
+			strings.Contains(ref, k8sPkgResource) ||
+			strings.Contains(ref, k8sPkgAutoscalingV1)
+	}
+
+	// Handle direct reference
+	ref := schema.Ref.String()
+	if isK8sRef(ref) {
+		tryReplaceK8sTypeWithMetaPath(schema, ref, useCorePath)
+		// Clear the original reference after replacement
+		schema.Ref = spec.Ref{}
+	}
+
+	// Handle AllOf - if all schemas in AllOf are k8s refs, we can replace the whole schema
+	allK8s := true
+	for _, one := range schema.AllOf {
+		if one.Ref.String() == "" || !isK8sRef(one.Ref.String()) {
+			allK8s = false
+			break
+		}
+	}
+
+	if allK8s && len(schema.AllOf) > 0 {
+		// Use the first AllOf ref for the replacement
+		ref := schema.AllOf[0].Ref.String()
+		tryReplaceK8sTypeWithMetaPath(schema, ref, useCorePath)
+		schema.AllOf = nil
+	} else {
+		// Process each AllOf individually
+		for i := range schema.AllOf {
+			goReferenceK8sTypeWithMetaPath(&schema.AllOf[i], useCorePath)
+		}
+	}
+
+	// Also check OneOf and AnyOf
+	for i := range schema.OneOf {
+		goReferenceK8sTypeWithMetaPath(&schema.OneOf[i], useCorePath)
+	}
+	for i := range schema.AnyOf {
+		goReferenceK8sTypeWithMetaPath(&schema.AnyOf[i], useCorePath)
+	}
+}
+
+func goReferenceK8sTypesProperties(props map[string]spec.Schema) {
+	goReferenceK8sTypesPropertiesWithMetaPath(props, true)
+}
+
+func goReferenceK8sTypesPropertiesWithMetaPath(props map[string]spec.Schema, useCorePath bool) {
+	for name, prop := range props {
+		goReferenceK8sTypeWithMetaPath(&prop, useCorePath)
+		goReferenceK8sTypesPropertiesWithMetaPath(prop.Properties, useCorePath)
+		if prop.Items != nil {
+			goReferenceK8sTypeWithMetaPath(prop.Items.Schema, useCorePath)
+			goReferenceK8sTypesPropertiesWithMetaPath(prop.Items.Schema.Properties, useCorePath)
+		}
+		if prop.AdditionalProperties != nil && prop.AdditionalProperties.Schema != nil {
+			goReferenceK8sTypeWithMetaPath(prop.AdditionalProperties.Schema, useCorePath)
+			goReferenceK8sTypesPropertiesWithMetaPath(prop.AdditionalProperties.Schema.Properties, useCorePath)
+		}
+
+		props[name] = prop
+	}
+}
+
+func tryReplaceK8sTypeWithMetaPath(schema *spec.Schema, ref string, useCorePath bool) {
+	lastDot := strings.LastIndex(ref, ".")
+	if lastDot == -1 {
+		return
+	}
+	t := ref[lastDot+1:]
+
+	// Determine the correct alias and path for meta.v1
+	metaAlias := "metacorev1"
+	metaPath := "dev.crossplane.io/models/io/k8s/core/meta/v1"
+	if !useCorePath {
+		metaAlias = "metav1"
+		metaPath = "dev.crossplane.io/models/io/k8s/meta/v1"
+	}
+
+	mapping := []struct {
+		contains   string
+		alias      string
+		importPath string
+	}{
+		{
+			contains:   k8sPkgMetaV1,
+			alias:      metaAlias,
+			importPath: metaPath,
+		},
+		{
+			contains:   k8sPkgCoreV1,
+			alias:      "corev1",
+			importPath: "dev.crossplane.io/models/io/k8s/core/v1",
+		},
+		{
+			contains:   k8sPkgRuntime,
+			alias:      "runtimev1",
+			importPath: "dev.crossplane.io/models/io/k8s/runtime/v1",
+		},
+		{
+			contains:   k8sPkgIntStr,
+			alias:      "intstrv1",
+			importPath: "dev.crossplane.io/models/io/k8s/util/v1",
+		},
+		{
+			contains:   k8sPkgResource,
+			alias:      "resourcev1",
+			importPath: "dev.crossplane.io/models/io/k8s/resource/v1",
+		},
+		{
+			contains:   k8sPkgAutoscalingV1,
+			alias:      "autoscalingv1",
+			importPath: "dev.crossplane.io/models/io/k8s/autoscaling/v1",
+		},
+	}
+
+	for _, m := range mapping {
+		if strings.Contains(ref, m.contains) {
+			schema.AddExtension("x-go-type", m.alias+"."+t)
+			schema.AddExtension("x-go-type-import", map[string]string{
+				"path": m.importPath,
+				"name": m.alias,
+			})
+			return
+		}
+	}
+}
+
+// isSharedK8sSchema returns true if the named schema belongs to one of the
+// k8s packages we generate as shared models for all other models to reference.
+func isSharedK8sSchema(name string) bool {
+	return strings.HasPrefix(name, k8sPkgMetaV1) ||
+		strings.HasPrefix(name, k8sPkgRuntime) ||
+		strings.HasPrefix(name, k8sPkgCoreV1) ||
+		strings.HasPrefix(name, k8sPkgIntStr) ||
+		strings.HasPrefix(name, k8sPkgResource) ||
+		strings.HasPrefix(name, k8sPkgAutoscalingV1)
+}
+
+// goRemoveK8s removes all k8s schemas from the given OpenAPI spec, so
+// that we can generate models for them separately and share them across all our
+// other generated models.
+func goRemoveK8s(s *spec3.OpenAPI) {
+	for name := range s.Components.Schemas {
+		if isSharedK8sSchema(name) {
+			delete(s.Components.Schemas, name)
+		}
+	}
+}
+
+// goKeepOnlyComponents leaves only the "components" portion of the OpenAPI spec
+// in place. This lets us make oapi-codegen generate code only for schemas and
+// not a full REST client.
+func goKeepOnlyComponents(s *spec3.OpenAPI) {
+	*s = spec3.OpenAPI{
+		Version:    s.Version,
+		Info:       s.Info,
+		Components: s.Components,
+	}
+}
+
+// goAddDefaults adds default values for apiVersion and kind properties based on
+// x-kubernetes-group-version-kind extension.
+func goAddDefaults(s *spec3.OpenAPI) {
+	if s.Components == nil || s.Components.Schemas == nil {
+		return
+	}
+
+	for _, schema := range s.Components.Schemas {
+		processSchemaDefaults(schema)
+	}
+}
+
+func processSchemaDefaults(schema *spec.Schema) {
+	// Look for x-kubernetes-group-version-kind extension
+	rawExt, ok := schema.Extensions["x-kubernetes-group-version-kind"]
+	if !ok {
+		return
+	}
+
+	// Convert the extension to a usable format
+	gvkList := extractGVKList(rawExt)
+	if len(gvkList) == 0 {
+		return
+	}
+
+	// Extract group, version, and kind from the first GVK
+	group, version, kind := extractGVKInfo(gvkList[0])
+
+	// Construct apiVersion
+	apiVersion := constructAPIVersion(group, version)
+
+	// Add defaults to properties
+	addSchemaPropertyDefaultsGo(schema, apiVersion, kind)
+}
+
+func extractGVKList(rawExt any) []map[string]any {
+	var gvkList []map[string]any
+	switch ext := rawExt.(type) {
+	case []any:
+		for _, item := range ext {
+			if gvk, ok := item.(map[string]any); ok {
+				gvkList = append(gvkList, gvk)
+			}
+		}
+	case []map[string]any:
+		gvkList = ext
+	}
+	return gvkList
+}
+
+func extractGVKInfo(gvk map[string]any) (group, version, kind string) {
+	if g, ok := gvk["group"].(string); ok {
+		group = g
+	}
+	if v, ok := gvk["version"].(string); ok {
+		version = v
+	}
+	if k, ok := gvk["kind"].(string); ok {
+		kind = k
+	}
+	return group, version, kind
+}
+
+func constructAPIVersion(group, version string) string {
+	if group != "" {
+		return group + "/" + version
+	}
+	return version
+}
+
+func addSchemaPropertyDefaultsGo(schema *spec.Schema, apiVersion, kind string) {
+	if schema.Properties == nil {
+		return
+	}
+
+	// Add default to apiVersion property
+	if propSchema, ok := schema.Properties["apiVersion"]; ok {
+		propSchema.Default = apiVersion
+		propSchema.Enum = []any{apiVersion}
+		schema.Properties["apiVersion"] = propSchema
+	}
+
+	// Add default to kind property
+	if propSchema, ok := schema.Properties["kind"]; ok {
+		propSchema.Default = kind
+		propSchema.Enum = []any{kind}
+		schema.Properties["kind"] = propSchema
+	}
+}
+
+// removeSelfImports removes self-imports and removes
+// the package prefix from types that would use the self-import.
+func removeSelfImports(code string, pkg string) (string, error) {
+	selfImports := map[string]struct {
+		Alias, Path string
+	}{
+		k8sPkgMetaV1:        {"metacorev1", "dev.crossplane.io/models/io/k8s/core/meta/v1"},
+		k8sPkgCoreV1:        {"corev1", "dev.crossplane.io/models/io/k8s/core/v1"},
+		k8sPkgRuntime:       {"runtimev1", "dev.crossplane.io/models/io/k8s/runtime/v1"},
+		k8sPkgIntStr:        {"intstrv1", "dev.crossplane.io/models/io/k8s/util/v1"},
+		k8sPkgResource:      {"resourcev1", "dev.crossplane.io/models/io/k8s/resource/v1"},
+		k8sPkgAutoscalingV1: {"autoscalingv1", "dev.crossplane.io/models/io/k8s/autoscaling/v1"},
+	}
+
+	info, ok := selfImports[pkg]
+	if !ok {
+		return code, nil // nothing to strip
+	}
+
+	// parse
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", code, parser.ParseComments)
+	if err != nil {
+		return "", errors.Wrap(err, "parsing Go code")
+	}
+
+	// delete the import (works for both named & unnamed imports)
+	astutil.DeleteImport(fset, f, info.Path)
+	astutil.DeleteNamedImport(fset, f, info.Alias, info.Path)
+
+	// strip selectors: transform `alias.Thing` → `Thing`
+	astutil.Apply(f, nil, func(c *astutil.Cursor) bool {
+		if sel, ok := c.Node().(*ast.SelectorExpr); ok {
+			if pkgIdent, ok := sel.X.(*ast.Ident); ok && pkgIdent.Name == info.Alias {
+				// replace the selector expr with just the identifier
+				c.Replace(&ast.Ident{Name: sel.Sel.Name, NamePos: sel.Sel.NamePos})
+			}
+		}
+		return true
+	})
+
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, f); err != nil {
+		return "", errors.Wrap(err, "formatting Go code")
+	}
+	return buf.String(), nil
+}
+
+// fixMissingImports add missing imports for K8s types.
+func fixMissingImports(code string) (string, error) {
+	// 1. Define the k8s imports you might need
+	k8sImports := map[string]string{
+		"metacorev1":    "dev.crossplane.io/models/io/k8s/core/meta/v1",
+		"metav1":        "dev.crossplane.io/models/io/k8s/meta/v1",
+		"corev1":        "dev.crossplane.io/models/io/k8s/core/v1",
+		"resourcev1":    "dev.crossplane.io/models/io/k8s/resource/v1",
+		"runtimev1":     "dev.crossplane.io/models/io/k8s/runtime/v1",
+		"intstrv1":      "dev.crossplane.io/models/io/k8s/util/v1",
+		"autoscalingv1": "dev.crossplane.io/models/io/k8s/autoscaling/v1",
+	}
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", code, parser.ParseComments)
+	if err != nil {
+		return "", errors.Wrap(err, "parsing failed")
+	}
+
+	needed := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if pkg, ok := sel.X.(*ast.Ident); ok {
+				if _, known := k8sImports[pkg.Name]; known {
+					needed[pkg.Name] = true
+				}
+			}
+		}
+		return true
+	})
+
+	for alias, path := range k8sImports {
+		if !needed[alias] {
+			continue
+		}
+		// AddNamedImport will do nothing if the import (with that alias) is already present
+		astutil.AddNamedImport(fset, f, alias, path)
+	}
+
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, fset, f); err != nil {
+		return "", errors.Wrap(err, "printing AST failed")
+	}
+	return buf.String(), nil
+}
+
+// fixK8sTypeNames uses AST manipulation to replace long K8s type names with short ones.
+func fixK8sTypeNames(code string) (string, error) {
+	// Parse the code
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", code, parser.ParseComments)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to parse Go code")
+	}
+
+	replacements := map[string]string{
+		// Types that map to time.Time.
+		"IoK8SApimachineryPkgApisMetaV1Time":      "Time",
+		"IoK8SApimachineryPkgApisMetaV1MicroTime": "MicroTime",
+		// Union types from IntOrString and their related methods.
+		"IoK8SApimachineryPkgUtilIntstrIntOrString0":      "Int",
+		"FromIoK8SApimachineryPkgUtilIntstrIntOrString0":  "FromInt",
+		"AsIoK8SApimachineryPkgUtilIntstrIntOrString0":    "AsInt",
+		"MergeIoK8SApimachineryPkgUtilIntstrIntOrString0": "MergeInt",
+		"IoK8SApimachineryPkgUtilIntstrIntOrString1":      "String",
+		"FromIoK8SApimachineryPkgUtilIntstrIntOrString1":  "FromString",
+		"AsIoK8SApimachineryPkgUtilIntstrIntOrString1":    "AsString",
+		"MergeIoK8SApimachineryPkgUtilIntstrIntOrString1": "MergeString",
+	}
+
+	// Walk the AST and replace type names
+	ast.Inspect(f, func(n ast.Node) bool {
+		if x, ok := n.(*ast.Ident); ok {
+			if newName, ok := replacements[x.Name]; ok {
+				x.Name = newName
+			}
+		}
+		return true
+	})
+
+	// Format and return the modified code
+	var buf strings.Builder
+	if err := format.Node(&buf, fset, f); err != nil {
+		return "", errors.Wrap(err, "failed to format Go code")
+	}
+
+	return buf.String(), nil
+}
+
+// GenerateFromOpenAPI generates Go schemas for the OpenAPI docs in the given filesystem.
+func (g goGenerator) GenerateFromOpenAPI(_ context.Context, fromFS afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	// Walk through filesystem to collect OpenAPI specs
+	openAPISpecs, err := collectOpenAPISpecs(fromFS)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(openAPISpecs) == 0 {
+		// Return nil if no specs were generated
+		return nil, nil
+	}
+
+	// Initialize the schema filesystem
+	schemaFS, err := initializeSchemaFS()
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate K8s shared schemas
+	if err := generateK8sSharedSchemas(openAPISpecs, schemaFS, g); err != nil {
+		return nil, err
+	}
+
+	// Generate models for the rest
+	if err := generateModelsWithGVK(openAPISpecs, schemaFS, g); err != nil {
+		return nil, err
+	}
+
+	return schemaFS, nil
+}
+
+// collectOpenAPISpecs walks through the filesystem to find and parse OpenAPI JSON files.
+func collectOpenAPISpecs(fromFS afero.Fs) ([]*spec3.OpenAPI, error) {
+	var openAPISpecs []*spec3.OpenAPI
+
+	err := afero.Walk(fromFS, "", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		// Only process JSON files
+		if !strings.HasSuffix(strings.ToLower(path), ".json") {
+			return nil
+		}
+
+		// Read the file content
+		bs, err := afero.ReadFile(fromFS, path)
+		if err != nil {
+			return errors.Wrapf(err, "failed to read file %q", path)
+		}
+
+		// Parse as OpenAPI spec
+		var spec spec3.OpenAPI
+		if err := json.Unmarshal(bs, &spec); err != nil {
+			// Skip files that aren't valid OpenAPI specs
+			return nil //nolint:nilerr // See comment above.
+		}
+
+		// Check if it has components/schemas
+		if spec.Components == nil || len(spec.Components.Schemas) == 0 {
+			return nil
+		}
+
+		openAPISpecs = append(openAPISpecs, &spec)
+		return nil
+	})
+
+	return openAPISpecs, err
+}
+
+// initializeSchemaFS creates and initializes the schema filesystem with go.mod
+// and go.sum.
+func initializeSchemaFS() (afero.Fs, error) {
+	schemaFS := afero.NewMemMapFs()
+	if err := schemaFS.Mkdir("models", 0o755); err != nil {
+		return nil, errors.Wrap(err, "failed to create models directory")
+	}
+
+	modf, err := schemaFS.Create("models/go.mod")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create go.mod")
+	}
+	if _, err := modf.WriteString(goModContents); err != nil {
+		return nil, errors.Wrap(err, "failed to write go.mod")
+	}
+
+	sumf, err := schemaFS.Create("models/go.sum")
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create go.sum")
+	}
+	if _, err := sumf.WriteString(goSumContents); err != nil {
+		return nil, errors.Wrap(err, "failed to write go.sum")
+	}
+
+	return schemaFS, nil
+}
+
+// generateK8sSharedSchemas extracts and generates shared K8s schemas.
+func generateK8sSharedSchemas(openAPISpecs []*spec3.OpenAPI, schemaFS afero.Fs, g goGenerator) error {
+	k8sSchemasByPackage := make(map[string]map[string]*spec.Schema)
+
+	// Collect all K8s schemas from all OpenAPI specs, grouped by package
+	for _, openAPISpec := range openAPISpecs {
+		packagedSchemas := goExtractK8sSchemas(openAPISpec)
+		for pkg, schemas := range packagedSchemas {
+			if k8sSchemasByPackage[pkg] == nil {
+				k8sSchemasByPackage[pkg] = make(map[string]*spec.Schema)
+			}
+			maps.Copy(k8sSchemasByPackage[pkg], schemas)
+		}
+	}
+
+	// Generate separate files for each K8s package
+	for pkg, schemas := range k8sSchemasByPackage {
+		if len(schemas) == 0 {
+			continue
+		}
+
+		if err := generateK8sPackageCode(pkg, schemas, schemaFS, g); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// generateK8sPackageCode generates code for a single K8s package.
+func generateK8sPackageCode(pkg string, schemas map[string]*spec.Schema, schemaFS afero.Fs, g goGenerator) error {
+	// Create a spec for this package
+	pkgSpec := &spec3.OpenAPI{
+		Version: "3.0.0",
+		Components: &spec3.Components{
+			Schemas: schemas,
+		},
+	}
+
+	// Determine the package layout, API group and version from the package name
+	goPkg := getK8sPackageInfo(pkg)
+
+	code, err := generateGo(pkgSpec, goPkg.version,
+		goRemoveValidationOnlyCombinators,
+		goRenameTypes,
+		goRenameEnums,
+		goReplaceNumberWithInt,
+		goRemoveRequired,
+		goReferenceK8sTypes,
+		goAddDefaults,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Fix k8s type names to use short names
+	code, err = fixK8sTypeNames(code)
+	if err != nil {
+		return errors.Wrap(err, "failed to fix K8s type names")
+	}
+	// Remove self-imports from k8s packages
+	code, err = removeSelfImports(code, pkg)
+	if err != nil {
+		return errors.Wrap(err, "failed to remove self imports")
+	}
+
+	// Add the generated methods last, so they see the final type names.
+	// runtime.Object goes first: addAccessors skips methods that already exist,
+	// so a field-derived accessor that would collide with one of these (say a
+	// field named objectKind) gives way, rather than emitting a duplicate.
+	code, err = applyRuntimeObjects(code, g.runtimeObjects)
+	if err != nil {
+		return err
+	}
+	code, err = applyAccessors(code, g.accessors)
+	if err != nil {
+		return errors.Wrap(err, "failed to generate Go model accessors")
+	}
+
+	return writeGoCode(schemaFS, goPkg, code)
+}
+
+// getK8sPackageInfo returns the generated package for a built-in Kubernetes
+// package. The group labels below only drive the directory layout; apimachinery
+// and core/v1 types are all in the core (empty) API group, so registering them
+// under their label would produce a GVK that disagrees with the GVK the type's
+// own apiVersion reports. Only autoscaling has a label that is also its API
+// group.
+func getK8sPackageInfo(pkg string) goPackage {
+	switch pkg {
+	case k8sPkgMetaV1:
+		return goPackage{group: "meta.core.k8s.io", kind: "meta", version: "v1"}
+	case k8sPkgRuntime:
+		return goPackage{group: "runtime.k8s.io", kind: "runtime", version: "v1"}
+	case k8sPkgCoreV1:
+		return goPackage{group: "core.k8s.io", kind: "core", version: "v1"}
+	case k8sPkgIntStr:
+		return goPackage{group: "util.k8s.io", kind: "intstr", version: "v1"}
+	case k8sPkgResource:
+		// Pseudo-group to distinguish the shared apimachinery Quantity
+		// package from the real resource.k8s.io API group (dynamic resource
+		// allocation); see goSchemaPath.
+		return goPackage{group: "resource.apimachinery.k8s.io", kind: "resource", version: "v1"}
+	case k8sPkgAutoscalingV1:
+		return goPackage{
+			group:    k8sPkgNameAutoscaling,
+			apiGroup: k8sPkgNameAutoscaling,
+			kind:     k8sPkgNameAutoscaling,
+			version:  "v1",
+		}
+	default:
+		return goPackage{}
+	}
+}
+
+// generateModelsWithGVK generates models for schemas with GVK information.
+func generateModelsWithGVK(openAPISpecs []*spec3.OpenAPI, schemaFS afero.Fs, g goGenerator) error {
+	for _, openAPISpec := range openAPISpecs {
+		gvkGroups := groupSchemasByGVK(openAPISpec)
+
+		for gvkKey, schemas := range gvkGroups {
+			// Skip groups whose schemas are all shared k8s package schemas
+			// (e.g. autoscaling/v1's Scale). They're generated by
+			// generateK8sSharedSchemas, and goRemoveK8s would leave this group
+			// empty, overwriting the shared package file with an empty one.
+			shared := true
+			for name := range schemas {
+				if !isSharedK8sSchema(name) {
+					shared = false
+					break
+				}
+			}
+			if shared {
+				continue
+			}
+
+			if err := generateGVKGroupCode(gvkKey, schemas, openAPISpec, schemaFS, g); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// groupSchemasByGVK groups schemas by their GVK information.
+func groupSchemasByGVK(openAPISpec *spec3.OpenAPI) map[string]map[string]*spec.Schema {
+	gvkGroups := make(map[string]map[string]*spec.Schema)
+
+	for name, schema := range openAPISpec.Components.Schemas {
+		gvkKey := extractGVKKey(schema)
+		if gvkKey == "" {
+			continue
+		}
+
+		if gvkGroups[gvkKey] == nil {
+			gvkGroups[gvkKey] = make(map[string]*spec.Schema)
+		}
+		gvkGroups[gvkKey][name] = schema
+	}
+
+	return gvkGroups
+}
+
+// extractGVKKey extracts the GVK key from a schema's extensions.
+func extractGVKKey(schema *spec.Schema) string {
+	gvkExt, ok := schema.Extensions["x-kubernetes-group-version-kind"]
+	if !ok {
+		return ""
+	}
+
+	gvkList, ok := gvkExt.([]any)
+	if !ok || len(gvkList) == 0 {
+		return ""
+	}
+
+	gvk, ok := gvkList[0].(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	group, ok := gvk["group"].(string)
+	if !ok {
+		return ""
+	}
+
+	version, ok := gvk["version"].(string)
+	if !ok || version == "" {
+		return ""
+	}
+
+	// Skip core group as it's already created upfront
+	if group == "core" || group == "" {
+		return ""
+	}
+
+	return group + "/" + version
+}
+
+// generateGVKGroupCode generates code for a GVK group.
+func generateGVKGroupCode(gvkKey string, schemas map[string]*spec.Schema, openAPISpec *spec3.OpenAPI, schemaFS afero.Fs, g goGenerator) error {
+	parts := strings.Split(gvkKey, "/")
+	group, version := parts[0], parts[1]
+
+	// Extract the kind from the group name for file naming
+	// For groups like "authentication.k8s.io", use "authentication" as the kind
+	// For groups like "policy", use "policy" as the kind
+	kind := group
+	if before, _, ok := strings.Cut(group, "."); ok {
+		kind = before
+	}
+
+	groupSpec := &spec3.OpenAPI{
+		Version: "3.0.0",
+		Components: &spec3.Components{
+			Schemas: make(map[string]*spec.Schema),
+		},
+	}
+
+	// Add the main schemas for this GVK group
+	maps.Copy(groupSpec.Components.Schemas, schemas)
+
+	// Add all other schemas from the same spec that might be referenced
+	// but don't have GVK extensions (like TokenRequestSpec, etc.)
+	// Add schemas that don't have GVK extensions (supporting types)
+	maps.Copy(groupSpec.Components.Schemas, openAPISpec.Components.Schemas)
+
+	code, err := generateGo(groupSpec, version,
+		goRemoveValidationOnlyCombinators,
+		goRenameTypes,
+		goRenameEnums,
+		goReplaceNumberWithInt,
+		goRemoveRequired,
+		goReferenceK8sTypes,
+		goRemoveK8s,
+		goKeepOnlyComponents,
+		goAddDefaults,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Add the generated methods last, so they see the final type names.
+	// runtime.Object goes first: addAccessors skips methods that already exist,
+	// so a field-derived accessor that would collide with one of these (say a
+	// field named objectKind) gives way, rather than emitting a duplicate.
+	code, err = applyRuntimeObjects(code, g.runtimeObjects)
+	if err != nil {
+		return err
+	}
+	code, err = applyAccessors(code, g.accessors)
+	if err != nil {
+		return errors.Wrap(err, "failed to generate Go model accessors")
+	}
+
+	return writeGoCode(schemaFS, packageInGroup(group, kind, version), code)
+}

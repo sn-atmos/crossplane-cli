@@ -1,0 +1,345 @@
+/*
+Copyright 2026 The Crossplane Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package generator
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"maps"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"github.com/invopop/jsonschema"
+	"github.com/spf13/afero"
+	extv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	runtimeSchema "k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/kube-openapi/pkg/spec3"
+	"k8s.io/kube-openapi/pkg/validation/spec"
+
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
+
+	devv1alpha1 "github.com/crossplane/cli/v2/apis/dev/v1alpha1"
+	"github.com/crossplane/cli/v2/internal/crd"
+	"github.com/crossplane/cli/v2/internal/schemas/runner"
+)
+
+// CRDJSONSchema holds a marshaled JSON Schema derived from a single CRD version.
+type CRDJSONSchema struct {
+	Data    []byte
+	Group   string
+	Version string
+	Kind    string
+}
+
+type jsonGenerator struct{}
+
+func (jsonGenerator) Language() string {
+	return devv1alpha1.SchemaLanguageJSON
+}
+
+// GenerateFromCRD generates jsonschemas for the CRDs in the given filesystem.
+func (jsonGenerator) GenerateFromCRD(_ context.Context, fromFS afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	openAPIs, err := goCollectOpenAPIs(fromFS)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(openAPIs) == 0 {
+		return nil, nil
+	}
+
+	schemaFS := afero.NewMemMapFs()
+	if err := schemaFS.Mkdir("models", 0o755); err != nil {
+		return nil, errors.Wrap(err, "failed to create models directory")
+	}
+
+	schemas := make(map[string]*spec.Schema)
+	for _, oapi := range openAPIs {
+		maps.Copy(schemas, oapi.spec.Components.Schemas)
+	}
+
+	for name, schema := range schemas {
+		jschema, err := ToJSONSchema(schema, runtimeSchema.GroupVersionKind{})
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to generate jsonschema for %s", name)
+		}
+
+		bs, err := json.Marshal(jschema)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to marshal jsonschema for %s", name)
+		}
+
+		fname := filepath.Join("models", strings.ReplaceAll(name, ".", "-")+".schema.json")
+		if err := afero.WriteFile(schemaFS, fname, bs, 0o644); err != nil {
+			return nil, errors.Wrapf(err, "failed to write jsonschema for %s", name)
+		}
+	}
+
+	return schemaFS, nil
+}
+
+// ToJSONSchema converts any JSON-compatible schema (e.g., *spec.Schema or *extv1.JSONSchemaProps)
+// to a *jsonschema.Schema with YAML language server compatibility fixes applied.
+// When gvk is non-empty, it also sets $id and x-kubernetes-group-version-kind metadata.
+func ToJSONSchema(s any, gvk runtimeSchema.GroupVersionKind) (*jsonschema.Schema, error) {
+	bs, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+
+	var conv jsonschema.Schema
+	if err := json.Unmarshal(bs, &conv); err != nil {
+		return nil, err
+	}
+
+	mutateJSONSchema(&conv)
+
+	if !gvk.Empty() {
+		conv.ID = jsonschema.ID(fmt.Sprintf("%s/%s/%s.json", gvk.Group, gvk.Version, strings.ToLower(gvk.Kind)))
+		conv.Extras = map[string]any{
+			"x-kubernetes-group-version-kind": []map[string]string{
+				{
+					"group":   gvk.Group,
+					"version": gvk.Version,
+					"kind":    gvk.Kind,
+				},
+			},
+		}
+	}
+
+	return &conv, nil
+}
+
+// CRDsToJSONSchemas converts CRD OpenAPI v3 schemas to marshaled JSON Schemas.
+// Referenced component schemas are embedded as $defs so each output is a self-contained document.
+func CRDsToJSONSchemas(crds []*extv1.CustomResourceDefinition) ([]CRDJSONSchema, error) {
+	var results []CRDJSONSchema
+
+	for _, c := range crds {
+		oapis, err := crd.ToOpenAPI(c)
+		if err != nil {
+			return nil, errors.Wrapf(err, "cannot convert CRD %q to OpenAPI", c.GetName())
+		}
+
+		group := c.Spec.Group
+		kind := c.Spec.Names.Kind
+		groupParts := strings.Split(group, ".")
+		slices.Reverse(groupParts)
+		reverseGroup := strings.Join(groupParts, ".")
+
+		for _, ver := range c.Spec.Versions {
+			oapi, ok := oapis[ver.Name]
+			if !ok {
+				continue
+			}
+
+			resourceName := reverseGroup + "." + ver.Name + "." + kind
+			schema, ok := oapi.Components.Schemas[resourceName]
+			if !ok {
+				continue
+			}
+
+			rewriteComponentRefs(schema)
+
+			gvk := runtimeSchema.GroupVersionKind{Group: group, Version: ver.Name, Kind: kind}
+			s, err := ToJSONSchema(schema, gvk)
+			if err != nil {
+				return nil, errors.Wrapf(err, "cannot convert schema for %s/%s %s", group, ver.Name, kind)
+			}
+
+			s.Definitions = make(jsonschema.Definitions)
+			for name, comp := range oapi.Components.Schemas {
+				// Skip the resource itself (already root) and List schemas
+				// generated by BuildOpenAPIV3 that $ref the root resource,
+				// which would create unresolvable references in $defs.
+				if name == resourceName || strings.HasSuffix(name, "List") {
+					continue
+				}
+				rewriteComponentRefs(comp)
+				defSchema, err := ToJSONSchema(comp, runtimeSchema.GroupVersionKind{})
+				if err != nil {
+					return nil, errors.Wrapf(err, "cannot convert $defs schema %s", name)
+				}
+				s.Definitions[name] = defSchema
+			}
+
+			data, err := json.MarshalIndent(s, "", "  ")
+			if err != nil {
+				return nil, errors.Wrapf(err, "cannot marshal JSON Schema for %s/%s %s", group, ver.Name, kind)
+			}
+
+			data = append(data, '\n')
+			results = append(results, CRDJSONSchema{
+				Data:    data,
+				Group:   group,
+				Version: ver.Name,
+				Kind:    kind,
+			})
+		}
+	}
+
+	return results, nil
+}
+
+// rewriteComponentRefs rewrites $ref paths from #/components/schemas/X to
+// #/$defs/X so they resolve within the same JSON Schema document.
+func rewriteComponentRefs(s *spec.Schema) {
+	if ref := s.Ref.String(); ref != "" {
+		if after, ok := strings.CutPrefix(ref, "#/components/schemas/"); ok {
+			s.Ref = spec.MustCreateRef("#/$defs/" + after)
+		}
+		return
+	}
+
+	for name, prop := range s.Properties {
+		rewriteComponentRefs(&prop)
+		s.Properties[name] = prop
+	}
+	if s.Items != nil && s.Items.Schema != nil {
+		rewriteComponentRefs(s.Items.Schema)
+	}
+	if s.AdditionalProperties != nil && s.AdditionalProperties.Schema != nil {
+		rewriteComponentRefs(s.AdditionalProperties.Schema)
+	}
+	for i := range s.AllOf {
+		rewriteComponentRefs(&s.AllOf[i])
+	}
+	for i := range s.AnyOf {
+		rewriteComponentRefs(&s.AnyOf[i])
+	}
+	for i := range s.OneOf {
+		rewriteComponentRefs(&s.OneOf[i])
+	}
+	if s.Not != nil {
+		rewriteComponentRefs(s.Not)
+	}
+}
+
+// mutateJSONSchema applies YAML language server compatibility fixes to a JSON
+// Schema: sets additionalProperties to false on object types and rewrites
+// component $ref paths to file references.
+func mutateJSONSchema(s *jsonschema.Schema) *jsonschema.Schema {
+	if s.Type == "object" && s.AdditionalProperties == nil && s.Properties.Len() > 0 {
+		s.AdditionalProperties = jsonschema.FalseSchema
+	}
+
+	if after, ok := strings.CutPrefix(s.Ref, "#/components/schemas/"); ok {
+		s.Ref = after
+		s.Ref = strings.ReplaceAll(s.Ref, ".", "-")
+		s.Ref += ".schema.json"
+	}
+
+	for i, schema := range s.AllOf {
+		s.AllOf[i] = mutateJSONSchema(schema)
+	}
+	for i, schema := range s.AnyOf {
+		s.AnyOf[i] = mutateJSONSchema(schema)
+	}
+	for i, schema := range s.OneOf {
+		s.OneOf[i] = mutateJSONSchema(schema)
+	}
+	if s.Not != nil {
+		s.Not = mutateJSONSchema(s.Not)
+	}
+
+	if s.Items != nil {
+		s.Items = mutateJSONSchema(s.Items)
+	}
+
+	if s.AdditionalProperties != nil {
+		s.AdditionalProperties = mutateJSONSchema(s.AdditionalProperties)
+	}
+
+	for prop := s.Properties.Oldest(); prop != nil; prop = prop.Next() {
+		s.Properties.Set(prop.Key, mutateJSONSchema(prop.Value))
+	}
+
+	return s
+}
+
+// GenerateFromOpenAPI generates jsonschemas from OpenAPI v3 specs.
+func (jsonGenerator) GenerateFromOpenAPI(_ context.Context, fromFS afero.Fs, _ runner.SchemaRunner) (afero.Fs, error) {
+	var openAPISpecs []*spec3.OpenAPI
+	err := afero.Walk(fromFS, "", func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if info.IsDir() {
+			return nil
+		}
+
+		if filepath.Ext(path) != ".json" {
+			return nil
+		}
+
+		bs, err := afero.ReadFile(fromFS, path)
+		if err != nil {
+			return errors.Wrapf(err, "failed to read OpenAPI file %q", path)
+		}
+
+		var openAPI spec3.OpenAPI
+		if err := json.Unmarshal(bs, &openAPI); err != nil {
+			return nil //nolint:nilerr // Skip invalid files.
+		}
+
+		if openAPI.Components != nil && len(openAPI.Components.Schemas) > 0 {
+			openAPISpecs = append(openAPISpecs, &openAPI)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to walk OpenAPI filesystem")
+	}
+
+	if len(openAPISpecs) == 0 {
+		return nil, nil
+	}
+
+	schemaFS := afero.NewMemMapFs()
+	if err := schemaFS.Mkdir("models", 0o755); err != nil {
+		return nil, errors.Wrap(err, "failed to create models directory")
+	}
+
+	schemas := make(map[string]*spec.Schema)
+	for _, oapi := range openAPISpecs {
+		maps.Copy(schemas, oapi.Components.Schemas)
+	}
+
+	for name, schema := range schemas {
+		jschema, err := ToJSONSchema(schema, runtimeSchema.GroupVersionKind{})
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to generate jsonschema for %s", name)
+		}
+
+		bs, err := json.Marshal(jschema)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to marshal jsonschema for %s", name)
+		}
+
+		fname := filepath.Join("models", strings.ReplaceAll(name, ".", "-")+".schema.json")
+		if err := afero.WriteFile(schemaFS, fname, bs, 0o644); err != nil {
+			return nil, errors.Wrapf(err, "failed to write jsonschema for %s", name)
+		}
+	}
+
+	return schemaFS, nil
+}
